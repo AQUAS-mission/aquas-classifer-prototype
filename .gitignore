@@ -6,3 +6,4 @@ __pycache__/
 output_data/
 *.egg-info/
 .env
+dataset/
