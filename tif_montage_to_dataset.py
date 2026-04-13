@@ -8,17 +8,23 @@ detected via fully-black vertical strips within each row band.
 
 Class name is derived from the filename: everything before the first underscore.
 
-Output: output_data/<classname>_<number>.png
+All output images are padded with black pixels to the global max dimension so every
+image in the dataset is square and uniform in size (max_dim x max_dim).
+
+Outputs:
+    dataset/images/<label>/<label>_<number>.png
+    dataset/manifest.csv  (chip_id, image_path, label, source_collage_path, x, y, w, h)
 
 Usage:
     python tif_montage_to_dataset.py
-    python tif_montage_to_dataset.py --input_dir test_data --output_dir output_data
+    python tif_montage_to_dataset.py --input_dir test_data --output_dir dataset
     python tif_montage_to_dataset.py --black_threshold 10
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -26,11 +32,6 @@ from PIL import Image
 
 
 VALID_EXTS = {".tif", ".tiff"}
-
-# Size to pad output images to. If an image is smaller than MAX_SIZE in either
-# dimension, black pixels are added on the right and/or bottom. Images larger
-# than MAX_SIZE are kept at their natural size. Set to None to skip padding.
-MAX_SIZE: int | None = 128
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("output_data"),
-        help="Directory where individual images will be written. Default: output_data",
+        default=Path("dataset"),
+        help="Root output directory. Images go to <output_dir>/images/<label>/. Default: dataset",
     )
     parser.add_argument(
         "--black_threshold",
@@ -94,15 +95,13 @@ def trim_black(crop: np.ndarray, black_threshold: int) -> np.ndarray:
     return crop[r0 : r1 + 1, c0 : c1 + 1]
 
 
-def pad_to_max_size(crop: np.ndarray, max_size: int) -> np.ndarray:
+def pad_to_size(crop: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     """
-    Pad the crop with black pixels on the right and bottom so that its
-    dimensions are at least max_size x max_size. If already larger, keep as-is.
+    Pad the crop with black pixels on the right and bottom to exactly
+    target_h x target_w. The crop must not exceed the target dimensions.
     """
     h, w = crop.shape[:2]
     channels = crop.shape[2] if crop.ndim == 3 else 1
-    target_h = max(h, max_size)
-    target_w = max(w, max_size)
 
     if h == target_h and w == target_w:
         return crop
@@ -114,7 +113,7 @@ def pad_to_max_size(crop: np.ndarray, max_size: int) -> np.ndarray:
 
 def extract_images(
     arr: np.ndarray, black_threshold: int
-) -> list[np.ndarray]:
+) -> list[tuple[np.ndarray, int, int, int, int]]:
     """
     Extract all individual images from a montage array.
 
@@ -122,11 +121,14 @@ def extract_images(
     1. Find row bands (separated by black rows).
     2. Within each row band, find column segments (separated by black columns).
     3. Trim residual black from each crop.
+
+    Returns a list of (chip_array, x, y, w, h) where x/y/w/h are the
+    chip's bounding box in the original montage coordinate space.
     """
     row_max = arr.max(axis=(1, 2))
     row_bands = find_bands(row_max, black_threshold)
 
-    images: list[np.ndarray] = []
+    chips: list[tuple[np.ndarray, int, int, int, int]] = []
     for r_start, r_end in row_bands:
         row_band = arr[r_start : r_end + 1]
 
@@ -135,11 +137,29 @@ def extract_images(
 
         for c_start, c_end in col_segs:
             crop = row_band[:, c_start : c_end + 1]
-            crop = trim_black(crop, black_threshold)
-            if crop.size > 0:
-                images.append(crop)
 
-    return images
+            # Compute trim offsets so we can record the exact bbox in the
+            # original montage coordinates.
+            row_max_crop = crop.max(axis=(1, 2))
+            col_max_crop = crop.max(axis=(0, 2))
+            non_black_rows = np.where(row_max_crop > black_threshold)[0]
+            non_black_cols = np.where(col_max_crop > black_threshold)[0]
+
+            if non_black_rows.size == 0 or non_black_cols.size == 0:
+                continue  # entirely black — skip
+
+            r0, r1 = int(non_black_rows[0]), int(non_black_rows[-1])
+            c0, c1 = int(non_black_cols[0]), int(non_black_cols[-1])
+            trimmed = crop[r0 : r1 + 1, c0 : c1 + 1]
+
+            if trimmed.size > 0:
+                orig_x = c_start + c0
+                orig_y = r_start + r0
+                orig_w = c1 - c0 + 1
+                orig_h = r1 - r0 + 1
+                chips.append((trimmed, orig_x, orig_y, orig_w, orig_h))
+
+    return chips
 
 
 def main() -> None:
@@ -154,9 +174,11 @@ def main() -> None:
     if not tif_paths:
         raise FileNotFoundError(f"No .tif/.tiff files found in {args.input_dir}")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    total_saved = 0
+    # First pass: extract all chips and track global max dimension for square padding.
+    # Each entry: (class_name, tif_path, chips) where chips = [(arr, x, y, w, h), ...]
+    all_classes: list[tuple[str, Path, list[tuple[np.ndarray, int, int, int, int]]]] = []
+    max_h = 0
+    max_w = 0
 
     for tif_path in tif_paths:
         class_name = tif_path.stem.split("_")[0]
@@ -165,19 +187,57 @@ def main() -> None:
         with Image.open(tif_path) as im:
             arr = np.array(im.convert("RGB"))
 
-        images = extract_images(arr, args.black_threshold)
-        print(f"  Found {len(images)} images")
+        chips = extract_images(arr, args.black_threshold)
+        print(f"  Found {len(chips)} chips")
 
-        for idx, img_arr in enumerate(images, start=1):
-            if MAX_SIZE is not None:
-                img_arr = pad_to_max_size(img_arr, MAX_SIZE)
+        for img_arr, *_ in chips:
+            max_h = max(max_h, img_arr.shape[0])
+            max_w = max(max_w, img_arr.shape[1])
 
-            out_path = args.output_dir / f"{class_name}_{idx}.png"
+        all_classes.append((class_name, tif_path, chips))
+
+    max_dim = max(max_h, max_w)
+    print(f"\nPadding all images to {max_dim}x{max_dim} (square)")
+
+    # Second pass: pad to max_dim x max_dim, save to dataset/images/<label>/, write manifest.
+    images_root = args.output_dir / "images"
+    manifest_path = args.output_dir / "manifest.csv"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    total_saved = 0
+    manifest_rows: list[dict] = []
+
+    for class_name, tif_path, chips in all_classes:
+        label_dir = images_root / class_name
+        label_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx, (img_arr, x, y, w, h) in enumerate(chips, start=1):
+            img_arr = pad_to_size(img_arr, max_dim, max_dim)
+            chip_id = f"{class_name}_{idx}"
+            rel_path = f"images/{class_name}/{chip_id}.png"
+            out_path = args.output_dir / rel_path
             Image.fromarray(img_arr).save(out_path)
+            manifest_rows.append({
+                "chip_id": chip_id,
+                "image_path": rel_path,
+                "label": class_name,
+                "source_collage_path": str(tif_path),
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+            })
 
-        total_saved += len(images)
+        total_saved += len(chips)
 
-    print(f"\nDone. Saved {total_saved} images to '{args.output_dir}/'")
+    fieldnames = ["chip_id", "image_path", "label", "source_collage_path", "x", "y", "w", "h"]
+    with manifest_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+
+    print(f"Done. Saved {total_saved} images to '{images_root}/'")
+    print(f"Manifest written to '{manifest_path}' ({len(manifest_rows)} rows)")
 
 
 if __name__ == "__main__":
