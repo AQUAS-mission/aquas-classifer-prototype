@@ -196,8 +196,9 @@ def main() -> None:
 
         all_classes.append((class_name, tif_path, chips))
 
-    max_dim = max(max_h, max_w)
-    print(f"\nPadding all images to {max_dim}x{max_dim} (square)")
+    MAX_DIM_CAP = 600
+    max_dim = min(max(max_h, max_w), MAX_DIM_CAP)
+    print(f"\nPadding all images to {max_dim}x{max_dim} (square, capped at {MAX_DIM_CAP})")
 
     # Second pass: pad to max_dim x max_dim, save to dataset/images/<label>/, write manifest.
     images_root = args.output_dir / "images"
@@ -212,6 +213,13 @@ def main() -> None:
         label_dir.mkdir(parents=True, exist_ok=True)
 
         for idx, (img_arr, x, y, w, h) in enumerate(chips, start=1):
+            # Scale down if the chip exceeds the cap, then pad to square.
+            ch, cw = img_arr.shape[:2]
+            if max(ch, cw) > max_dim:
+                scale = max_dim / max(ch, cw)
+                new_cw, new_ch = int(cw * scale), int(ch * scale)
+                img_pil = Image.fromarray(img_arr).resize((new_cw, new_ch), Image.LANCZOS)
+                img_arr = np.array(img_pil)
             img_arr = pad_to_size(img_arr, max_dim, max_dim)
             chip_id = f"{class_name}_{idx}"
             rel_path = f"images/{class_name}/{chip_id}.png"

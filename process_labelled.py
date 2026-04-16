@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """
-Process the labelled library folder into the shared dataset.
+Process all labelled library folders into the shared dataset.
 
-Walks raw/labelled/10X Libraries/<SpeciesDir>/ and extracts all chips from
-every .tif file inside each species directory. The subdirectory name IS the
-class label (e.g., the Closterium/ folder contains 7 sub-species TIFs,
-all labelled "Closterium").
+Handles three folder layouts found under raw/labelled/:
+
+  1. Species-directory layout  (e.g. 10X Libraries/)
+       raw/labelled/10X Libraries/<SpeciesName>/<anything>.tif
+       → label = parent directory name  (e.g. "Anabaena")
+
+  2. Flat filename layout  (e.g. FlowCam Cyano Example/Libraries/)
+       raw/labelled/FlowCam Cyano Example/Libraries/Anabaena_lib_images_000001.tif
+       → label = stem.split("_")[0]  (e.g. "Anabaena")
+
+  3. Example-prefix layout  (e.g. Libraries - Freshwater Organisms/*/)
+       Example_Anabaena-coiled_10X_AI_lib_images_000001.tif
+       → strip "Example_", take part before "_10X", strip "-variant" suffix
+       → "Anabaena"
 
 Behaviour:
   - New species → creates dataset/images/<species>/ automatically.
@@ -17,7 +27,7 @@ Behaviour:
 
 Usage:
     python process_labelled.py
-    python process_labelled.py --labelled_dir "raw/labelled/10X Libraries"
+    python process_labelled.py --labelled_dir raw/labelled
     python process_labelled.py --dataset_dir dataset --black_threshold 10
 """
 
@@ -38,6 +48,39 @@ VALID_EXTS = {".tif", ".tiff"}
 MANIFEST_FIELDNAMES = ["chip_id", "image_path", "label", "source_collage_path",
                         "x", "y", "w", "h"]
 
+# Directory names that are organiser containers, not species labels.
+# TIFs whose immediate parent is one of these use filename-based label extraction.
+NON_SPECIES_DIRS = {
+    "Libraries",
+    "Auto-Image Libraries",
+    "Trigger Mode Libraries",
+    "Filters",
+}
+
+
+def extract_label(tif_path: Path) -> str:
+    """
+    Determine the species label for a TIF file.
+
+    Layout detection:
+      - If the TIF's immediate parent is NOT in NON_SPECIES_DIRS, the parent
+        directory IS the species label (species-directory layout).
+      - If the filename starts with "Example_", strip the prefix, take the
+        part before "_10X", then strip any "-variant" suffix.
+      - Otherwise take the first "_"-delimited token of the stem.
+    """
+    parent = tif_path.parent.name
+    if parent not in NON_SPECIES_DIRS:
+        return parent  # species-dir layout
+
+    stem = tif_path.stem
+    if stem.startswith("Example_"):
+        without_prefix = stem[len("Example_"):]
+        before_10x = without_prefix.split("_10X")[0]  # e.g. "Anabaena-coiled"
+        return before_10x.split("-")[0]               # e.g. "Anabaena"
+
+    return stem.split("_")[0]  # flat-filename layout
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -46,9 +89,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--labelled_dir",
         type=Path,
-        default=Path("raw/labelled/10X Libraries"),
-        help="Directory whose sub-folders are species labels. "
-             "Default: raw/labelled/10X Libraries",
+        default=Path("raw/labelled"),
+        help="Root labelled directory containing all source sub-folders. "
+             "Default: raw/labelled",
     )
     parser.add_argument(
         "--dataset_dir",
@@ -155,22 +198,23 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # Discover all (label, tif_path) pairs
+    # Recursively find every .tif under labelled_dir and extract its label.
     # ------------------------------------------------------------------
-    species_dirs = sorted(
-        d for d in args.labelled_dir.iterdir() if d.is_dir()
-    )
-    if not species_dirs:
-        raise FileNotFoundError(f"No species subdirectories found in {args.labelled_dir}")
-
-    # Build list: (label, tif_path)
     tif_entries: list[tuple[str, Path]] = []
-    for species_dir in species_dirs:
-        label = species_dir.name
-        tifs = sorted(p for p in species_dir.iterdir() if p.suffix.lower() in VALID_EXTS)
-        for tif_path in tifs:
-            tif_entries.append((label, tif_path))
+    for tif_path in sorted(args.labelled_dir.rglob("*")):
+        if tif_path.suffix.lower() not in VALID_EXTS:
+            continue
+        label = extract_label(tif_path)
+        tif_entries.append((label, tif_path))
 
-    print(f"\nFound {len(tif_entries)} TIF files across {len(species_dirs)} species")
+    if not tif_entries:
+        raise FileNotFoundError(f"No .tif/.tiff files found under {args.labelled_dir}")
+
+    unique_labels = sorted({label for label, _ in tif_entries})
+    print(f"\nFound {len(tif_entries)} TIF files across {len(unique_labels)} species:")
+    for lbl in unique_labels:
+        count = sum(1 for l, _ in tif_entries if l == lbl)
+        print(f"  {lbl}: {count} TIF(s)")
 
     # ------------------------------------------------------------------
     # First pass: extract all chips, find new global max_dim
@@ -193,10 +237,11 @@ def main() -> None:
 
         by_label.setdefault(label, []).append((tif_path, chips))
 
+    MAX_DIM_CAP = 600
     new_max_dim = max(new_max_h, new_max_w)
-    global_max_dim = max(existing_native_dim, new_max_dim)
+    global_max_dim = min(max(existing_native_dim, new_max_dim), MAX_DIM_CAP)
     print(f"\nNew data max chip size: {new_max_dim}px")
-    print(f"Global max dim (all data): {global_max_dim}px")
+    print(f"Global max dim (all data, capped at {MAX_DIM_CAP}): {global_max_dim}px")
 
     # ------------------------------------------------------------------
     # Re-pad existing chips if new data is larger
@@ -220,6 +265,13 @@ def main() -> None:
 
         for tif_path, chips in tif_list:
             for img_arr, x, y, w, h in chips:
+                # Scale down if the chip exceeds the cap, then pad to square.
+                ch, cw = img_arr.shape[:2]
+                if max(ch, cw) > global_max_dim:
+                    scale = global_max_dim / max(ch, cw)
+                    new_cw, new_ch = int(cw * scale), int(ch * scale)
+                    img_pil = Image.fromarray(img_arr).resize((new_cw, new_ch), Image.LANCZOS)
+                    img_arr = np.array(img_pil)
                 img_arr = pad_to_size(img_arr, global_max_dim, global_max_dim)
                 chip_id = f"{label}_{chip_counter}"
                 rel_path = f"images/{label}/{chip_id}.png"
@@ -259,7 +311,7 @@ def main() -> None:
         class_to_idx = {c: i for i, c in enumerate(all_classes)}
 
         info["native_chip_size"] = global_max_dim
-        info["input_size"] = max(global_max_dim, info.get("input_size", 0))
+        info["input_size"] = global_max_dim
         info["num_classes"] = len(all_classes)
         info["classes"] = all_classes
         info["class_to_idx"] = class_to_idx
