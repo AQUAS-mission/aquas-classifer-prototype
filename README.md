@@ -145,3 +145,30 @@ All chips are stored at **600×600px** (RGB, black-padded to square). Chips extr
 2. Run `python process_labelled.py` — new chips are appended without touching existing ones
 3. Run `python build_dataset.py` — splits are regenerated
 4. Re-run `python train.py --model <model>` to retrain
+
+
+## Questions for P.I. Goes:
+1. Should we ignore bacteria species that have very little amounts of data (sub 50 images)? Planning to run augmentation on all classification species, but for species with very little starting data, augmentation does not help.
+- Will ask his team to grab more data! 
+- Search online for flowcam, 10x freshwater images. 
+
+
+2. What are specific algae attributes to look for (separate from traditional Machine Learning/Computer Vision model)? Examples: Diameter, Length, Shape, Color, etc.
+- Circular vs. filamentus style cell
+- Opaqueness
+- Density
+- Aspect ratio
+- Goes will send us a spreadsheet on what measurements flowcam records. --> used PCI, no image at all. 
+
+3. Would you prefer binary classification or probabilistic classification? Probabilistic example would be where the model says the image is 70% likely to be this species and 20% this species and 10% this other species, so it's most likely the 70% species. Binary just outputs the species.
+- Probabilistic 
+
+4. Are there any regression components to the project or is it only classification for now?
+- Classification is fine for now. Add in regression components later if necessary. 
+
+5. Are there specific species we should prioritize more than others?
+- Microcystis
+
+6. Is there a specific input image size that is best to train our models on or is this arbitrary and up to us?
+- Not sure. Will need to calibrate with the new microscope. 
+- Goes will ask lab staff for clearer answers. 
