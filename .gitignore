@@ -7,3 +7,5 @@ output_data/
 *.egg-info/
 .env
 dataset/
+runs/
+tea_debug.log

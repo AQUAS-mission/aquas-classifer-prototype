@@ -33,6 +33,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+try:
+    import wandb as _wandb_module
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
@@ -123,6 +128,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed. Default: 42",
+    )
+    parser.add_argument(
+        "--wandb", action="store_true",
+        help="Enable Weights & Biases logging (requires `pip install wandb` and `wandb login`).",
+    )
+    parser.add_argument(
+        "--wandb_project", type=str, default="algae-classification",
+        help="W&B project name. Default: algae-classification",
+    )
+    parser.add_argument(
+        "--wandb_run_name", type=str, default=None,
+        help="W&B run name. Defaults to the run directory name.",
     )
     return parser.parse_args()
 
@@ -420,6 +437,40 @@ def main() -> None:
     (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     # ------------------------------------------------------------------ #
+    # W&B initialisation                                                   #
+    # ------------------------------------------------------------------ #
+    wb = None
+    if args.wandb:
+        if not _WANDB_AVAILABLE:
+            raise ImportError(
+                "wandb is not installed. Run: pip install wandb\n"
+                "Then authenticate once with: wandb login"
+            )
+        wb = _wandb_module
+        wb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or run_dir.name,
+            config={
+                "model":           args.model,
+                "epochs_frozen":   args.epochs_frozen,
+                "epochs_finetune": args.epochs_finetune,
+                "batch_size":      args.batch_size,
+                "lr_head":         args.lr_head,
+                "lr_finetune":     args.lr_finetune,
+                "weight_decay":    args.weight_decay,
+                "label_smoothing": args.label_smoothing,
+                "input_size":      input_size,
+                "num_classes":     num_classes,
+                "seed":            args.seed,
+                "train_samples":   len(train_ds),
+                "val_samples":     len(val_ds),
+                "test_samples":    len(test_ds),
+            },
+            dir=str(run_dir),
+        )
+        print(f"W&B run: {wb.run.url}")
+
+    # ------------------------------------------------------------------ #
     # Model                                                                #
     # ------------------------------------------------------------------ #
     model = build_model(args.model, num_classes).to(device)
@@ -462,6 +513,16 @@ def main() -> None:
                 f"({elapsed:.1f}s)"
             )
 
+            if wb:
+                wb.log({
+                    "phase": 1,
+                    "epoch": epoch,
+                    "train/loss": train_loss,
+                    "train/acc":  train_acc,
+                    "val/loss":   val_loss,
+                    "val/acc":    val_acc,
+                })
+
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 torch.save(model.state_dict(), best_ckpt_path)
@@ -499,6 +560,16 @@ def main() -> None:
             f"({elapsed:.1f}s)"
         )
 
+        if wb:
+            wb.log({
+                "phase": 2,
+                "epoch": args.epochs_frozen + epoch,
+                "train/loss": train_loss,
+                "train/acc":  train_acc,
+                "val/loss":   val_loss,
+                "val/acc":    val_acc,
+            })
+
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), best_ckpt_path)
@@ -520,12 +591,44 @@ def main() -> None:
     all_preds, all_labels = collect_predictions(model, test_loader, device)
     metrics = build_metrics(all_labels, all_preds, classes, run_dir)
 
+    if wb:
+        # Summary scalars
+        wb.summary["best_val_acc"] = best_val_acc
+        wb.summary["test_acc"]     = metrics["accuracy"]
+        wb.summary["macro_f1"]     = metrics["macro_avg"].get("f1-score", 0.0)
+
+        # Per-class metrics table
+        table = wb.Table(columns=["class", "precision", "recall", "f1", "support"])
+        for cls, m in metrics["per_class"].items():
+            table.add_data(cls, round(m["precision"], 4), round(m["recall"], 4),
+                           round(m["f1"], 4), int(m["support"]))
+        wb.log({"test/per_class_metrics": table})
+
+        # Confusion matrix
+        cm = metrics["confusion_matrix"]
+        wb.log({
+            "test/confusion_matrix": wb.plot.confusion_matrix(
+                probs=None,
+                y_true=all_labels,
+                preds=all_preds,
+                class_names=classes,
+            )
+        })
+
+        # Upload best checkpoint as artifact
+        artifact = wb.Artifact(name=f"{args.model}-best", type="model")
+        artifact.add_file(str(best_ckpt_path))
+        wb.log_artifact(artifact)
+
     # ------------------------------------------------------------------ #
     # ONNX export                                                          #
     # ------------------------------------------------------------------ #
     onnx_path = run_dir / "model.onnx"
     export_onnx(model, input_size, onnx_path, device)
     print(f"\nONNX model exported → {onnx_path}")
+
+    if wb:
+        wb.finish()
 
     print(f"\nAll outputs in: {run_dir}/")
     print("  best.pt      — best val_acc checkpoint")

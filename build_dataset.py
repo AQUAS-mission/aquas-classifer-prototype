@@ -109,23 +109,30 @@ def main() -> None:
         raise ValueError("manifest.csv is empty.")
 
     # ------------------------------------------------------------------ #
-    # Determine input size from native chip dimensions                     #
+    # Determine input size from chip bounding-box dimensions in manifest  #
     # ------------------------------------------------------------------ #
-    first_img = args.dataset_dir / rows[0]["image_path"]
-    if not first_img.exists():
-        raise FileNotFoundError(f"Image referenced in manifest not found: {first_img}")
-
-    native_w, native_h = png_size(first_img)
-    native_size = max(native_w, native_h)   # chips are square; be safe
-    input_size = max(native_size, MIN_INPUT_SIZE)
-
-    if native_size < MIN_INPUT_SIZE:
+    # Use the 90th-percentile of max(w, h) across all original chips.
+    # This is robust to the few very elongated outliers (e.g. 32x1738) and
+    # gives a training resolution that represents the bulk of the data well.
+    # Augmented rows have w=h=0 and are excluded automatically.
+    chip_max_dims = sorted(
+        max(int(r["w"]), int(r["h"]))
+        for r in rows
+        if r.get("w") and r.get("h") and r["w"] not in ("0", "") and r["h"] not in ("0", "")
+    )
+    if chip_max_dims:
+        p90_idx = min(int(len(chip_max_dims) * 0.90), len(chip_max_dims) - 1)
+        p90_dim = chip_max_dims[p90_idx]
+        input_size = max(min(p90_dim, 600), MIN_INPUT_SIZE)
         print(
-            f"Native chip size {native_size}px is smaller than {MIN_INPUT_SIZE}px. "
-            f"Training will resize images up to {input_size}px."
+            f"Chip dimensions — p90 max(w,h)={p90_dim}px, "
+            f"min={chip_max_dims[0]}px, max={chip_max_dims[-1]}px "
+            f"→ using {input_size}px as input_size."
         )
     else:
-        print(f"Native chip size {native_size}px — using {input_size}px as input_size.")
+        # Fallback: no w/h data (shouldn't happen for a fresh dataset)
+        input_size = MIN_INPUT_SIZE
+        print(f"No chip dimension data found — using {input_size}px as input_size.")
 
     # ------------------------------------------------------------------ #
     # Class inventory                                                      #
@@ -214,7 +221,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     info = {
         "input_size": input_size,
-        "native_chip_size": native_size,
+        "native_chip_size": input_size,
         "num_classes": len(classes),
         "classes": classes,
         "class_to_idx": class_to_idx,
